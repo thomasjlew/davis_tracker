@@ -1,5 +1,5 @@
 # davis_tracker
-# About this project
+## About this project
 This program tracks features using events from an "Event-Camera" such as the DAVIS [1]. The features are first extracted from raw images. This project implements this paper [2] with a few modifications.  <br />
 
 ## Results
