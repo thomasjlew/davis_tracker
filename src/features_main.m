@@ -16,7 +16,7 @@
 %
 % Other m-files required:   icp.m [3]
 %                           knnsearch.m
-%                           is_in_patch.m
+%                           is_in_patch.m   % Not anymore: too slow ...
 % Subfunctions: none
 % MAT-files required: none
 % Dataset required:     Any set from "The Event-Camera Dataset" [2]
@@ -24,13 +24,13 @@
 % References:
 %   [1] D. Tedaldi, G. Gallego, E. Mueggler, and D. Scaramuzza, “Feature
 %       detection and tracking with the dynamic and active-pixel vision 
-%       sensor (DAVIS),” in Int. Conf. on Event-Based Control, Comm. and 
+%       sensor (DAVIS),�? in Int. Conf. on Event-Based Control, Comm. and 
 %       Signal Proc. (EBCCSP), Krakow, Poland, Jun. 2016.
 %   [2] E. Mueggler, H. Rebecq, G. Gallego, T. Delbruck, D. Scaramuzza
 %       The Event-Camera Dataset and Simulator: Event-based Data for Pose 
 %       Estimation, Visual Odometry, and SLAM, International Journal of 
 %       Robotics Research, Vol. 36, Issue 2, pages 142-149, Feb. 2017.
-%   [3] P. Besl and N. D. McKay, “A method for registration of 3-D shapes,”
+%   [3] P. Besl and N. D. McKay, “A method for registration of 3-D shapes,�?
 %       IEEE Trans. Pattern Anal. Machine Intell., vol. 14, no. 2, 
 %       pp. 239–256, 1992.
 
@@ -79,20 +79,26 @@ DATASET_PATH = './shapes_6dof/';
 % DATASET_PATH = './poster_6dof/';
 
 B_EXTRACT_FRAMES_ONLY_ONCE = true;
-NB_MAX_FRAMES = inf;
+NB_MAX_FRAMES = 10;
 SIZE_FRAME_IMG = 0; %   Initialized in the code
-NB_STRONGEST_FEAT = 4;  % number of new features to be tracked
+NB_STRONGEST_FEAT = 10;  % number of new features to be tracked
 PATCH_WIDTH = 24; % We use square patches of width 25 (around middle pixel)
 
 % NB_MAX_EVENTS_PER_FRAME = 10000; %  Should be removed
+PATCH_PLOT_ID = 1;
 B_PLOT_EVENTS = false;
+B_PLOT_CORNERS_ONCE = true; % plot extracted features only once (faster)
+B_PLOT_SUBPLOT2 = false;
 B_PLOT_SUBPLOT3 = false;
-PATCH_PLOT_ID = 3;
+global B_PLOT_ONLY_MAIN_PLOT; 
+B_PLOT_ONLY_MAIN_PLOT = not(B_PLOT_SUBPLOT2 || B_PLOT_SUBPLOT3);
 
 % From paper [1]:  "In practice,
 % it is more efficient to compute the registration transformation
 % every M events, e.g., of half the size of the model point set."
 NEW_EVENTS_TO_REGISTR_FACTOR = 2;
+
+MAX_ITER_ICP = 4; % for processing time purpose: Matlab is slow...
 
 %   Open .txt files
 frames_fileID = fopen(strcat(DATASET_PATH,'images.txt'),'r');
@@ -101,6 +107,8 @@ events_fileID = fopen(strcat(DATASET_PATH,'events.txt'),'r');
 %   Initialize patches
 patches = [];
 
+% Matlab profile viewer to examine execution time
+profile on 
 
 %%  MAIN LOOP
 %   Process NB_MAX_FRAMES frames and events until that timestamp
@@ -120,10 +128,15 @@ for frame_nb = 1:NB_MAX_FRAMES
     frame_cur_img = imread(frame_cur_img_file);
     SIZE_FRAME_IMG = size(frame_cur_img);
     
-    subplot1_setup(strcat('Raw Image n°', int2str(frame_nb),' with features'), ...
+    subplot1_setup(strcat('\fontsize{20}Image n.', int2str(frame_nb),' with tracked features'), ...
                     frame_cur_img);
     %   --------------------------------------
     
+%     % Delay for recording
+%     if frame_nb==1
+%         pause
+%         pause(1)
+%     end
     
     %   -------------------------------------------
     %   -------------------------------------------
@@ -132,63 +145,70 @@ for frame_nb = 1:NB_MAX_FRAMES
     %   -------------------------------------------
     
     %   1) Extract Corner points on the frame (Harris detector)
-    new_corners = detectHarrisFeatures(frame_cur_img);
-    nb_new_corners = min(NB_STRONGEST_FEAT,new_corners.Count);
-    new_corners = new_corners.selectStrongest(nb_new_corners);
-    new_corners.Location = (new_corners.Location);  %   Convert to Integer
-    
-    %   plot new_corners (features) in green and saved patches in blue
-    subplot_plot_corners_feat(1, new_corners, patches);
-    
-        
-    %   2) Extract and plotEdges (Canny edge detector) 
-    %       (returns a binary image, 1 if edge pixel; 0 otherwise).
-    edges_img = edge(frame_cur_img,'canny');
+    if not(B_PLOT_CORNERS_ONCE) || (frame_nb==1)
+        new_corners = detectHarrisFeatures(frame_cur_img);
+        nb_new_corners = min(NB_STRONGEST_FEAT,new_corners.Count);
+        new_corners = new_corners.selectStrongest(nb_new_corners);
+        new_corners.Location = (new_corners.Location);  %   Convert to Integer
 
-    %   ------------------------------------------------------------
-    %   3a) Extract local edge-map patches around corner points, and
-    % convert them into patches and model point sets.
-    for feat_id=1:nb_new_corners
-        %   Add these corner points as new patches
-        new_patch = [];
-        new_patch.feat_pos = (new_corners(feat_id).Location); %    !! OPTIMIZE CODE HERE !!
-        %   Initialize patch structure fields
-        %new_patch.binary_img = zeros(PATCH_WIDTH+1,PATCH_WIDTH+1);
-        new_patch.model_pts = [];
-        new_patch.data_pts = [];
-        new_patch.nb_new_events = 0;
-        
-        for id_x=1:PATCH_WIDTH+1
-            for id_y=1:PATCH_WIDTH+1
-                %   Check if patch element is out of image
-                if (new_patch.feat_pos(1) - PATCH_WIDTH/2 + id_x) < 0 || ...   %   x
-                   (new_patch.feat_pos(1) - PATCH_WIDTH/2 + id_x) > SIZE_FRAME_IMG(2) || ...
-                   (new_patch.feat_pos(2) - PATCH_WIDTH/2 + id_y) < 0 || ...   %   y
-                   (new_patch.feat_pos(2) - PATCH_WIDTH/2 + id_y) > SIZE_FRAME_IMG(1)
-                    disp('OUT OF IMAGE!!!')
-                    break
-                end
-                
-                %   Add model points ( defined in patch coordinates, with 
-                %                       zero at top left corner )
-                if edges_img(int16(new_patch.feat_pos(2)) - PATCH_WIDTH/2 + id_y, ... 
-                             int16(new_patch.feat_pos(1)) - PATCH_WIDTH/2 + id_x) 
-                    %new_patch.binary_img(id_y,id_x) = 1;
-                    new_model_pt = [new_patch.feat_pos(1) - PATCH_WIDTH/2 + id_x; ...
-                                    new_patch.feat_pos(2) - PATCH_WIDTH/2 + id_y];
-                    new_patch.model_pts = [new_patch.model_pts, single(new_model_pt)];
+        %   plot new_corners (features) in green and saved patches in blue
+        subplot_plot_corners_feat(1, new_corners, patches);
+
+
+        %   2) Extract and plotEdges (Canny edge detector) 
+        %       (returns a binary image, 1 if edge pixel; 0 otherwise).
+        edges_img = edge(frame_cur_img,'canny');
+
+        %   ------------------------------------------------------------
+        %   3a) Extract local edge-map patches around corner points, and
+        % convert them into patches and model point sets.
+        for feat_id=1:nb_new_corners
+            %   Add these corner points as new patches
+            new_patch = [];
+            new_patch.feat_pos = (new_corners(feat_id).Location); %    !! OPTIMIZE CODE HERE !!
+            %   Initialize patch structure fields
+            %new_patch.binary_img = zeros(PATCH_WIDTH+1,PATCH_WIDTH+1);
+            new_patch.model_pts = [];
+            new_patch.data_pts = [];
+            new_patch.nb_new_events = 0;
+
+            for id_x=1:PATCH_WIDTH+1
+                for id_y=1:PATCH_WIDTH+1
+                    %   Check if patch element is out of image
+                    if (new_patch.feat_pos(1) - PATCH_WIDTH/2 + id_x) < 0 || ...   %   x
+                       (new_patch.feat_pos(1) - PATCH_WIDTH/2 + id_x) > SIZE_FRAME_IMG(2) || ...
+                       (new_patch.feat_pos(2) - PATCH_WIDTH/2 + id_y) < 0 || ...   %   y
+                       (new_patch.feat_pos(2) - PATCH_WIDTH/2 + id_y) > SIZE_FRAME_IMG(1)
+                        disp('OUT OF IMAGE!!!')
+                        break
+                    end
+
+                    %   Add model points ( defined in patch coordinates, with 
+                    %                       zero at top left corner )
+                    if edges_img(int16(new_patch.feat_pos(2)) - PATCH_WIDTH/2 + id_y, ... 
+                                 int16(new_patch.feat_pos(1)) - PATCH_WIDTH/2 + id_x) 
+                        %new_patch.binary_img(id_y,id_x) = 1;
+                        new_model_pt = [new_patch.feat_pos(1) - PATCH_WIDTH/2 + id_x; ...
+                                        new_patch.feat_pos(2) - PATCH_WIDTH/2 + id_y];
+                        new_patch.model_pts = [new_patch.model_pts, single(new_model_pt)];
+                    end
                 end
             end
+            %   Define data point set of the same size as model point set
+            new_patch.data_pts = zeros(size(new_patch.model_pts));
+
+            %   If B_EXTRACT_FRAMES_ONLY_ONCE is true, then only 1st frame
+            %   features will be extracted added to patches
+            if not(B_EXTRACT_FRAMES_ONLY_ONCE && (frame_nb > 1))
+                disp('adding new patch')
+                %   Add to new patch struct. to patches vector
+                patches = [patches, new_patch];
+            end
         end
-            
-        %   If B_EXTRACT_FRAMES_ONLY_ONCE is true, then only 1st frame
-        %   features will be extracted added to patches
-        if not(B_EXTRACT_FRAMES_ONLY_ONCE && (frame_nb > 1))
-            disp('adding new patch')
-            %   Add to new patch struct. to patches vector
-            patches = [patches, new_patch];
-        end
+    else
+        subplot_plot_corners_feat(1, [], patches);
     end
+    
     %   END  FEATURES DETECTION from frame image
     %   -------------------------------------------
     %   -------------------------------------------
@@ -199,18 +219,20 @@ for frame_nb = 1:NB_MAX_FRAMES
     %   SUBPLOT 2: Plot features locations on the 2nd subplot
     %               blue: tracked features
     %               green: new extracted corners (features)
-    subplot2_setup('Edges and Locations of patches', edges_img);
-    subplot_plot_corners_feat(2, new_corners, patches);
-    for feat_id=1:size(new_corners,1)%nb_new_corners
-        patch_plot_contours(sb2_fh,new_corners(feat_id).Location,PATCH_WIDTH,'r'); hold on;
+    if B_PLOT_SUBPLOT2
+        subplot2_setup('Edges and Locations of patches', edges_img);
+        subplot_plot_corners_feat(2, new_corners, patches);
+        for feat_id=1:size(new_corners,1)%nb_new_corners
+            patch_plot_contours(sb2_fh,new_corners(feat_id).Location,PATCH_WIDTH,'r'); hold on;
+        end
+        patch_plot_contours(sb2_fh,patches(PATCH_PLOT_ID).feat_pos,PATCH_WIDTH,'y');
     end
-    patch_plot_contours(sb2_fh,patches(PATCH_PLOT_ID).feat_pos,PATCH_WIDTH,'y');
     
     %   Debugging: Display one patch more closely
     %   Display the patch of interest in yellow
     %   SUBPLOT 3: Plot Model&data points of the patch
     if B_PLOT_SUBPLOT3
-        subplot3_setup(strcat('Model & Data Points of patch n�',int2str(PATCH_PLOT_ID)), ...
+        subplot3_setup(strcat('Model & Data Points of patch n.',int2str(PATCH_PLOT_ID)), ...
                                              patches, PATCH_PLOT_ID, PATCH_WIDTH);
     end
     %   END FEATURES DETECTION PLOTTING
@@ -227,7 +249,6 @@ for frame_nb = 1:NB_MAX_FRAMES
     
     %   Process events until frame timestamp
     disp(' >> Processing events');
-    event_cur_t = 0;
     while (event_cur_t < frame_cur_t)   %     for event_nb = 1:NB_MAX_EVENTS_PER_FRAME
 %         disp('  >> event nb: ');disp(event_nb);
 %         tmp_event=textscan(events_fileID,'%f %d %d %d',1,'Delimiter','\n'); % almost double of time!!!
@@ -248,7 +269,12 @@ for frame_nb = 1:NB_MAX_FRAMES
         %   Check in which patches this event belongs to and add to 
         %       model point set of the patch
         for patch_id=1:length(patches)
-            if(is_in_patch(event_x, event_y, patches(patch_id), PATCH_WIDTH)==true)
+            
+            if  event_x >= (patches(patch_id).feat_pos(1) - PATCH_WIDTH/2) && ...
+                event_x <= (patches(patch_id).feat_pos(1) + PATCH_WIDTH/2) && ...
+                event_y >= (patches(patch_id).feat_pos(2) - PATCH_WIDTH/2) && ...
+                event_y <= (patches(patch_id).feat_pos(2) + PATCH_WIDTH/2)
+%             if(is_in_patch(event_x, event_y, patches(patch_id), PATCH_WIDTH)==true)
                 %   --------------------
                 %   FEATURE REGISTRATION
                 %   --------------------
@@ -258,6 +284,7 @@ for frame_nb = 1:NB_MAX_FRAMES
                 %       opt1: define mask and multiply with patch mask
                 %               todo and test speed (+memory...)
                 %       opt2: compute all distances
+                %       opt3 (paper): include it after knnsearch
                 b_event_is_outlier = true;                      %%% !!!! -> -> -> OPTIMIZATION: INCLUDE THIS AFTER REGISTRATION WITH NEAREST NEIGHBOURS  !!!!
                 for model_pt_id = 1:size(patches(patch_id).model_pts,2)
                     if abs(event_x-patches(patch_id).model_pts(1,model_pt_id)) <= 2 && ...
@@ -275,39 +302,61 @@ for frame_nb = 1:NB_MAX_FRAMES
 
                 %   Display a debugging patch
                 if (patch_id==PATCH_PLOT_ID) && B_PLOT_SUBPLOT3
-%                         disp(strcat('1 new event in patch nb�',int2str(PATCH_PLOT_ID),'!'));
+%                         disp(strcat('1 new event in patch nb.',int2str(PATCH_PLOT_ID),'!'));
                     subplot(2,2,3); hold on;
                     scatter(event_x, event_y,'b');
-                    pause(0.000000000001); % Otherwise, plot doesn't displays...   !!! FIX THAT !!!
+                    pause(0.000000000001); % Otherwise, plot doesn't displays...   !!! TO BE FIXED !!!
                 end
 
                 %   --------------------
 
                 %   Update the corresponding data point set
-                patches(patch_id).data_pts = [patches(patch_id).data_pts, [event_x; event_y]];
+%                 patches(patch_id).data_pts = [patches(patch_id).data_pts, [event_x; event_y]];
+                for i=1:size(patches(patch_id).data_pts,2)
+                    %   Find a non initialized element
+                    if patches(patch_id).data_pts(1,i) == 0 && ...
+                       patches(patch_id).data_pts(2,i) == 0
+                        patches(patch_id).data_pts(1:2,i) = [event_x; event_y];
+                        break;
+                    end
+                end
 
                 %   --------------------------------------------
                 %   2) Compute the REGISTRATION TRANSFORMATION A 
                 %   between the matched point sets using the iterative 
                 %   closest point algorithm
                 %   --------------------------------------------
-                if patches(patch_id).nb_new_events > ...
+                if patches(patch_id).nb_new_events >= ...
                    size(patches(patch_id).model_pts,2) / NEW_EVENTS_TO_REGISTR_FACTOR
 
-%                         disp(strcat('Computing registration for patch nb�',int2str(PATCH_PLOT_ID)));
+%                         disp(strcat('Computing registration for patch nb.',int2str(PATCH_PLOT_ID)));
                     patches(patch_id).nb_new_events = 0;
-
-                    %   Get neirest neighbours and convert to 3D point cloud
+                    
+                    
+                    %   Remove non initialized data points
+                    IDs_model_initialized = [];
+                    for i=1:size(patches(patch_id).data_pts,2)
+                        if patches(patch_id).data_pts(1,i) ~= 0 && ...
+                           patches(patch_id).data_pts(2,i) ~= 0
+                            IDs_model_initialized = [IDs_model_initialized, i];
+                        end
+                    end
+                    
+                    %   Get nearest neighbours and convert to 3D point cloud
 %                         [ID_model, dists] = knnsearch(single(patches(patch_id).model_pts)',single(patches(patch_id).data_pts)'); % matlab knn func
-                    [ID_model, dists] = knnsearch(single(patches(patch_id).data_pts)',single(patches(patch_id).model_pts)'); % knnsearch added func
+%                     [ID_model, dists] = knnsearch(single(patches(patch_id).data_pts)',...
+%                                                   single(patches(patch_id).model_pts)'); % knnsearch added func
+                    [ID_model, dists] = knnsearch(single(patches(patch_id).data_pts(1:2,IDs_model_initialized))',...
+                                                  single(patches(patch_id).model_pts)'); % knnsearch added func
                     AVG_dists = sum(dists)/size(patches(patch_id).data_pts,2);
 
                     %       REJECT OUTLIERS  %%% !!!! -> -> -> OPTIMIZATION: INCLUDE THIS AFTER REGISTRATION WITH NEAREST NEIGHBOURS  !!!!
 
-
-
-                    cloud_model_pts = zeros(3,size(patches(patch_id).data_pts,2)); %    after outliers rejection: change the size definition here
-                    cloud_data_pts = zeros(3,size(patches(patch_id).data_pts,2));
+%                     cloud_model_pts = zeros(3,size(patches(patch_id).data_pts,2));
+%                     cloud_data_pts = zeros(3,size(patches(patch_id).data_pts,2));
+                    cloud_model_pts = zeros(3,size(IDs_model_initialized,2));
+                    cloud_data_pts = zeros(3,size(IDs_model_initialized,2));
+                    
                     for id = 1:size(cloud_model_pts,2)
                         if (patch_id == PATCH_PLOT_ID) && B_PLOT_SUBPLOT3
                             scatter(single(patches(patch_id).model_pts(1,ID_model(id))),single(patches(patch_id).model_pts(2,ID_model(id))),'c*');
@@ -325,7 +374,7 @@ for frame_nb = 1:NB_MAX_FRAMES
 
                     %   Compute 3D Euclidean transformation         !!! OPTIMISATION: LATEST PAPER USES WEIGHTS TO MAKE IT MOREPRECISE !!!
 %                         A = pcregrigid(pt_cloud_model_pts,pt_cloud_data_pts) ;
-                    [R, t, ER] = icp(pt_cloud_model_pts.Location',pt_cloud_data_pts.Location');
+                    [R, t, ER] = icp(pt_cloud_model_pts.Location',pt_cloud_data_pts.Location',MAX_ITER_ICP);
                     t=-t(1:2)';
                     R=R(1:2,1:2);
 %                         A = pcregrigid(pt_cloud_data_pts,pt_cloud_model_pts) ;
@@ -365,7 +414,11 @@ for frame_nb = 1:NB_MAX_FRAMES
                     %   -----------------------------------------------
                     %   Remove older data points
 %                         patches(patch_id).data_pts = [];
-                    patches(patch_id).data_pts = patches(patch_id).data_pts(1:2,uint16(size(patches(patch_id).data_pts,2)/NEW_EVENTS_TO_REGISTR_FACTOR):end);
+%                     patches(patch_id).data_pts = patches(patch_id).data_pts(1:2,uint16(size(patches(patch_id).data_pts,2)/NEW_EVENTS_TO_REGISTR_FACTOR):end);
+                    if size(IDs_model_initialized,2) > uint16(size(patches(patch_id).model_pts,2))/NEW_EVENTS_TO_REGISTR_FACTOR
+                        patches(patch_id).data_pts(1:2,1:uint16(size(patches(patch_id).data_pts,2))) = ...
+                            zeros(2,uint16(size(patches(patch_id).data_pts,2)));
+                    end
                     %   -----------------------------------------------
 
                     %   -------------------------
@@ -405,24 +458,55 @@ fclose('all');
 
 %%  Plotting functions
 function subplot1_setup(my_title, image)
+    global B_PLOT_ONLY_MAIN_PLOT
+    
     hFig = figure(1);
     set(hFig, 'Position', [100 0 1000 1000])
     
-    subplot(2,2,1);
+    if not(B_PLOT_ONLY_MAIN_PLOT)
+        subplot(2,2,1);
+    end
     imshow(image);
     title(my_title);
     hold on;
 end
 
 function subplot_plot_corners_feat(subplot_id, new_corners, patches)
-    subplot(2,2,subplot_id);
+    global B_PLOT_ONLY_MAIN_PLOT;
     
-    plot(new_corners);      %    in green
-    if min(size(patches)) > 0
-        for i=1:size(patches,2)
-            plot(patches(i).feat_pos(1),patches(i).feat_pos(2),'b+');
-        end
+    if not(B_PLOT_ONLY_MAIN_PLOT)
+        subplot(2,2,subplot_id);
     end
+    
+    %   ------------------------------------
+    %   Plot extracted corners
+    %   60% optimization time using these functions rather than
+    %   "plot(new_corners);"
+    %   ------------------------------------
+    corner_pts=zeros(2,size(new_corners,1));
+    for i=1:size(new_corners,1)
+        corner_pt = new_corners(i);
+%         plot(corner_pt.Location(1),corner_pt.Location(2),'g+');
+        corner_pts(1,i) = corner_pt.Location(1);
+        corner_pts(2,i) = corner_pt.Location(2);
+    end
+    plot(corner_pts(1,1:end),corner_pts(2,1:end),'g+');
+    %   ------------------------------------
+    
+    %   ------------------------------------
+    %   Plot tracked features
+    if min(size(patches)) > 0
+        feat_positions = zeros(2,size(patches,2));
+        for i=1:size(patches,2)
+            feat_positions(1,i) = patches(i).feat_pos(1);
+            feat_positions(2,i) = patches(i).feat_pos(2);
+            %plot(patches(i).feat_pos(1),patches(i).feat_pos(2),'b+');
+        end
+        plot(feat_positions(1,1:end),feat_positions(2,1:end),'g+');
+    end
+    %   ------------------------------------
+    
+    pause(0.000000001);    %    Necessary to show result
 end
 
 function subplot2_setup(my_title, image)
@@ -470,4 +554,45 @@ function patch_plot_contours( fh, pt, SQUARE_WIDTH, clr )
     
 end
 
+%   -----------------------------------------------------------------------
+%	IS_IN_PATCH - Determines if a point is inside a patch
+%   Note: this function is too slow when called multiple times in matlab
+% 
+% Syntax:  is_in_patch(event_x, event_y, patches(patch_id), PATCH_WIDTH)
+%
+% Inputs:
+%   -   pt_x: x position of the point
+%   -   pt_y: y position of the point
+%   -   patch: patch structure as defined in "features_main.m"
+%   -   PATCH_WIDTH: Width of the patch
+%
+% Outputs:
+%    Boolean: true if the event is in the patch
+%
+% Example: 
+%    if is_in_patch(event_x, event_y, patches(patch_id), PATCH_WIDTH)
+%           ...
+% 
+% Author:   Thomas Lew
+% email:    lewt@ethz.ch
+% Website:  https://github.com/thomasjlew/
+% September 2017; Last revision: 22-September-2017
+function [ b_is_inside_patch ] = is_in_patch( pt_x, pt_y, patch, PATCH_WIDTH )
+%IS_IN_PATCH - Returns true if the point is inside the patch
+%   Inputs:
+%       patch - structure containing all elements of a patch
+%           patch.feat_pos   -   x&y coord of features point wrt. img
+%           patch.model_pts  -   coord of model points wrt. image
+%       pt_x & pt_y - point coordinates wrt. image
+    if  pt_x >= (patch.feat_pos(1) - PATCH_WIDTH/2) && ...
+        pt_x <= (patch.feat_pos(1) + PATCH_WIDTH/2) && ...
+        pt_y >= (patch.feat_pos(2) - PATCH_WIDTH/2) && ...
+        pt_y <= (patch.feat_pos(2) + PATCH_WIDTH/2)
+        b_is_inside_patch = true;
+        return
+    else
+        b_is_inside_patch = false;
+        return
+    end
+end
 %------------- END OF CODE --------------
